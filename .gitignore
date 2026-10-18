@@ -1,0 +1,7 @@
+work/
+build/
+*.class
+lib/
+# the game is never committed: your own exiledkingdoms.jar stays outside the repo
+*.nro
+*.sav

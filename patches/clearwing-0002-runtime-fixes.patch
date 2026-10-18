@@ -1,0 +1,923 @@
+diff --git i/runtime/res/clearwing/src/Clearwing.cpp w/runtime/res/clearwing/src/Clearwing.cpp
+index dc39996..04f5106 100644
+--- i/runtime/res/clearwing/src/Clearwing.cpp
++++ w/runtime/res/clearwing/src/Clearwing.cpp
+@@ -1,6 +1,11 @@
+ #include "Clearwing.h"
++#include <algorithm>
++#include <unordered_map>
+ 
+ #include "java/lang/String.h"
++#include "java/lang/Object.h"
++
++extern "C" jmonitor getObjectMonitor(jobject object); // below: monitors are created on first use
+ #include "java/lang/Class.h"
+ #include "java/lang/Thread.h"
+ #include "java/lang/ClassCastException.h"
+@@ -149,7 +154,7 @@ void shutdownVM(jcontext ctx) {
+             done = false;
+             threadContext->lock.lock();
+             if (threadContext->blockedBy)
+-                ((jmonitor) ((jobject) threadContext->blockedBy)->monitor)->condition.notify_all();
++                getObjectMonitor((jobject) threadContext->blockedBy)->condition.notify_all();
+             threadContext->lock.unlock();
+         }
+         if (done)
+@@ -347,9 +352,20 @@ void *resolveInterfaceMethod(jcontext ctx, jclass interface, int method, jobject
+ 
+     auto objectClass = (jclass) object->clazz;
+ 
++    // per-thread direct-mapped cache in front of the locked maps (every interface call took the mutex and two map
++    // searches); the offset vectors live in map nodes, which never move
++    struct CacheEntry { jclass interface; jclass objectClass; const std::vector<int> *offsets; };
++    static thread_local CacheEntry cache[256];
++    auto &entry = cache[(((uintptr_t) interface >> 4) ^ ((uintptr_t) objectClass >> 4)) & 255];
++    if (entry.interface == interface && entry.objectClass == objectClass) {
++        int offset = (int) entry.offsets->size() <= method ? -1 : (*entry.offsets)[method];
++        if (offset != -1)
++            return ((void **) object->vtable)[offset];
++    }
++
+     int offset;
+     {
+-        std::lock_guard guard(lock); // Todo: Making thread_local rather than locking is probably much faster
++        std::lock_guard guard(lock);
+ 
+         std::map<jclass, std::vector<int>> &objectMappings = mappings[interface];
+ 
+@@ -372,11 +388,13 @@ void *resolveInterfaceMethod(jcontext ctx, jclass interface, int method, jobject
+                 }
+                 offsets[i] = found;
+             }
+-            objectMappings[objectClass] = offsets;
++            auto &stored = objectMappings[objectClass] = offsets;
+             offset = offsets[method];
++            entry = { interface, objectClass, &stored };
+         } else {
+             auto &offsets = offsetsIt->second;
+             offset = (int)offsets.size() <= method ? -1 : offsets[method];
++            entry = { interface, objectClass, &offsets };
+         }
+     }
+ 
+@@ -386,6 +404,67 @@ void *resolveInterfaceMethod(jcontext ctx, jclass interface, int method, jobject
+     return ((void **) object->vtable)[offset];
+ }
+ 
++extern "C" void array_finalize(jcontext ctx, jobject self); // Array.cpp
++
++// An object's monitor is created on first use (synchronized/wait/notify): allocating one per object doubled the
++// malloc/free traffic, and almost none is ever used
++extern "C" jmonitor getObjectMonitor(jobject object) {
++    auto monitor = __atomic_load_n(&object->monitor, __ATOMIC_ACQUIRE);
++    if (monitor)
++        return (jmonitor) monitor;
++    auto created = new ObjectMonitor;
++    decltype(monitor) expected = 0;
++    if (__atomic_compare_exchange_n(&object->monitor, &expected, (decltype(monitor)) created, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++        heapUsage += (int64_t) sizeof(ObjectMonitor);
++        return created;
++    }
++    delete created; // another thread won
++    return (jmonitor) expected;
++}
++
++// Collected objects are freed by the allocating threads, a few per allocation (sweepPending), not by the collection
++// thread: on the Switch both threads fought over newlib's malloc lock and every GC left seconds of 4 fps behind it.
++// The collection thread only runs the finalizers that may run Java code or take locks, then queues here.
++static std::vector<jobject> pendingFree; // guarded by objectsLock
++static constexpr int SWEEP_PER_ALLOCATION = 8;
++
++// Finalizers that only release native memory: run inline by the sweep
++static bool memoryOnlyFinalizer(jobject obj) {
++    auto finalizer = ((void **) obj->vtable)[VTABLE_java_lang_Object_finalize];
++    return finalizer == (void *) M_java_lang_Object_finalize || finalizer == (void *) array_finalize
++           || finalizer == (void *) M_java_lang_String_finalize;
++}
++
++/// Frees objects taken off pendingFree (already erased from `objects`). Called without objectsLock.
++static void freeObjects(jcontext ctx, jobject *batch, int count) {
++    for (int i = 0; i < count; i++) {
++        jobject obj = batch[i];
++        auto finalizer = ((void **) obj->vtable)[VTABLE_java_lang_Object_finalize];
++        if (finalizer == (void *) array_finalize || finalizer == (void *) M_java_lang_String_finalize)
++            ((finalizer_ptr) finalizer)(ctx, obj);
++        if (obj->monitor) {
++            delete (ObjectMonitor *) obj->monitor;
++            heapUsage -= (int64_t) sizeof(ObjectMonitor);
++        }
++        memset(obj, 0, sizeof(java_lang_Object)); // Erase collected objects to make memory bugs easier to catch
++        obj->gcMark = GC_MARK_COLLECTED;
++        delete[] (char *) obj;
++    }
++}
++
++/// Pops up to `count` pending objects and erases them from `objects`. Caller holds objectsLock.
++static int takePending(jobject *batch, int count) {
++    int n = 0;
++    while (n < count && !pendingFree.empty()) {
++        jobject obj = pendingFree.back();
++        pendingFree.pop_back();
++        objects->erase(obj);
++        heapUsage -= ((jclass) obj->clazz)->size;
++        batch[n++] = obj;
++    }
++    return n;
++}
++
+ jobject gcAllocObject(jcontext ctx, jclass clazz, int mark) {
+     if (!objects) {
+         objects = new ankerl::unordered_dense::set<jobject>;
+@@ -399,22 +478,26 @@ jobject gcAllocObject(jcontext ctx, jclass clazz, int mark) {
+         constructAndThrow<&class_java_lang_OutOfMemoryError, init_java_lang_OutOfMemoryError>(ctx);
+ 
+     auto object = (jobject) new char[clazz->size]{};
+-    heapUsage += clazz->size + (int64_t) sizeof(ObjectMonitor);
++    heapUsage += clazz->size;
+     allocationsSinceCollection++;
+ 
+     *object = {
+         .clazz = (intptr_t) clazz,
+         .gcMark = mark,
+         .vtable = (intptr_t) clazz->classVtable,
+-        .monitor = (intptr_t) new ObjectMonitor,
++        .monitor = 0, // getObjectMonitor
+     };
+ 
++    jobject sweep[SWEEP_PER_ALLOCATION];
+     objectsLock.lock();
+     if (mark == GC_MARK_START)
+         objects->emplace(object);
+     else
+         rootObjects->emplace(object);
++    int swept = pendingFree.empty() ? 0 : takePending(sweep, SWEEP_PER_ALLOCATION);
+     objectsLock.unlock();
++    if (swept)
++        freeObjects(ctx, sweep, swept);
+ 
+     return object;
+ }
+@@ -495,6 +578,80 @@ void deregisterWeak(jweak reference) {
+ }
+ 
+ /// Creates a new context. Does not throw exceptions.
++// ponytail: sampling profiler for the console (no perf there). With a "prof" file in the working dir, the GC's
++// collection thread (awake every ms; a thread of its own hung the boot on the Switch) reads the main thread's shadow
++// stack and appends to prof.log, every 10 s, the methods most often on top (self) and the top caller->callee pairs.
++// Reads race the game thread on purpose: statistics only. FrameInfos are static data (the transpiler emits them
++// static), so a stale pointer still names some method.
++struct Sampler {
++    std::unordered_map<const char *, int> self, inclusive;
++    std::unordered_map<std::string, int> pairs;
++    int samples = 0;
++    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
++
++    static bool plausible(const FrameInfo *info) {
++        auto anchor = (uintptr_t) &suspendVM; // static data of the binary: FrameInfos live near it, thread stacks don't
++        auto a = (uintptr_t) info;
++        return info && (a > anchor ? a - anchor : anchor - a) < (1ull << 30);
++    }
++
++    void sample(jcontext main) {
++        int depth = main->stackDepth;
++        if (depth <= 0 || depth >= MAX_STACK_DEPTH)
++            return;
++        const FrameInfo *top = main->frames[depth - 1].info;
++        const FrameInfo *caller = depth > 1 ? main->frames[depth - 2].info : nullptr;
++        if (!plausible(top))
++            return;
++        self[top->method]++;
++        const char *seen[64]; // each method once per sample, even when recursive
++        int nSeen = 0;
++        for (int i = depth - 1; i >= 0 && nSeen < 64; i--) {
++            const FrameInfo *info = main->frames[i].info;
++            if (!plausible(info)) continue;
++            bool dup = false;
++            for (int j = 0; j < nSeen && !dup; j++) dup = seen[j] == info->method;
++            if (dup) continue;
++            seen[nSeen++] = info->method;
++            inclusive[info->method]++;
++        }
++        if (plausible(caller))
++            pairs[std::string(caller->method) + " -> " + top->method]++;
++        samples++;
++    }
++
++    void dumpIfDue() {
++        if (samples == 0 || std::chrono::steady_clock::now() - last < std::chrono::seconds(10))
++            return;
++        last = std::chrono::steady_clock::now();
++        std::vector<std::pair<int, std::string>> top, topPairs, topInclusive;
++        for (auto &pair : self) top.emplace_back(pair.second, pair.first);
++        for (auto &pair : inclusive) topInclusive.emplace_back(pair.second, pair.first);
++        for (auto &pair : pairs) topPairs.emplace_back(pair.second, pair.first);
++        auto byCount = [](auto &a, auto &b) { return a.first > b.first; };
++        std::sort(top.begin(), top.end(), byCount);
++        std::sort(topPairs.begin(), topPairs.end(), byCount);
++        std::sort(topInclusive.begin(), topInclusive.end(), byCount);
++        if (FILE *f = fopen("prof.log", "a")) {
++            fprintf(f, "== %lld: %d samples\n", (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
++                    std::chrono::system_clock::now().time_since_epoch()).count(), samples);
++            for (int i = 0; i < (int) top.size() && i < 25; i++)
++                fprintf(f, "  %5.1f%% %s\n", 100.0 * top[i].first / samples, top[i].second.c_str());
++            fprintf(f, "  inclusive:\n");
++            for (int i = 0; i < (int) topInclusive.size() && i < 40; i++)
++                fprintf(f, "  %5.1f%% %s\n", 100.0 * topInclusive[i].first / samples, topInclusive[i].second.c_str());
++            fprintf(f, "  callers:\n");
++            for (int i = 0; i < (int) topPairs.size() && i < 15; i++)
++                fprintf(f, "  %5.1f%% %s\n", 100.0 * topPairs[i].first / samples, topPairs[i].second.c_str());
++            fclose(f);
++        }
++        self.clear();
++        inclusive.clear();
++        pairs.clear();
++        samples = 0;
++    }
++};
++
+ jcontext createContext() {
+     auto context = new Context;
+     context->jniEnv = createJni(context);
+@@ -513,9 +670,23 @@ void destroyContext(jcontext context) {
+     delete context;
+ }
+ 
++
++#ifdef __SWITCH__
++extern "C" uint32_t svcSetThreadCoreMask(uint32_t handle, int32_t preferredCore, uint32_t affinityMask);
++#endif
++// The Switch starts every thread on the main thread's core: move helpers to the two other cores the app may use
++static inline void pinCurrentThreadToCore(int core) {
++#ifdef __SWITCH__
++    svcSetThreadCoreMask(0xFFFF8000 /* CUR_THREAD_HANDLE */, core, 1u << core); // failure (applet mode): stays put
++#else
++    (void) core;
++#endif
++}
++
+ static void collectionThreadFunc(jcontext ctx) {
+     static std::vector<jobject> collected;
+ 
++    pinCurrentThreadToCore(1); // freeing ~500k objects after a GC took the game's core for seconds
+     attachThread(ctx);
+ 
+     try {
+@@ -532,31 +703,34 @@ static void collectionThreadFunc(jcontext ctx) {
+ 
+             if (!collected.empty()) {
+                 for (jobject obj : collected) {
++                    if (memoryOnlyFinalizer(obj)) // empty, or native memory only: the sweep handles it
++                        continue;
+                     tryCatch(frameRef, [&]{
+                         ((finalizer_ptr)((void **)obj->vtable)[VTABLE_java_lang_Object_finalize])(ctx, obj);
+                     }, &class_java_lang_Throwable, [](jobject ignored){});
+                 }
+ 
+-                for (jobject obj : collected) {
+-                    objectsLock.lock();
+-                    objects->erase(obj);
+-                    objectsLock.unlock();
+-
+-                    heapUsage -= ((jclass) obj->clazz)->size + (int64_t) sizeof(ObjectMonitor);
+-
+-                    delete (ObjectMonitor *) obj->monitor;
+-
+-                    memset(obj, 0, sizeof(java_lang_Object)); // Erase collected objects to make memory bugs easier to catch
+-                    obj->gcMark = GC_MARK_COLLECTED; // Set collected flag again
+-
+-                    delete[] (char *) obj;
+-                }
+-
++                objectsLock.lock();
++                pendingFree.insert(pendingFree.end(), collected.begin(), collected.end());
++                objectsLock.unlock();
+                 collected.clear();
+             }
+ 
+         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+ 
++        static int profiling = -1;
++        static Sampler *sampler;
++        if (profiling < 0) {
++            FILE *probe = fopen("prof", "r");
++            profiling = probe != nullptr;
++            if (probe) fclose(probe);
++            if (profiling) sampler = new Sampler;
++        }
++        if (profiling && !threadContexts.empty()) {
++            sampler->sample(threadContexts[0]); // the first context is the main thread's (initVM)
++            sampler->dumpIfDue();
++        }
++
+             SAFEPOINT();
+         }
+     } catch (ExitException &) { }
+@@ -601,6 +775,8 @@ void runGC(jcontext ctx) {
+     auto copyTime = std::chrono::system_clock::now();
+ 
+     acquireCriticalLock();
++    // The collection thread erases from `objects` without reaching a safepoint: hold its lock for mark + collect
++    objectsLock.lock();
+ 
+     static jint mark;
+     if (++mark > GC_MARK_END)
+@@ -663,12 +839,25 @@ void runGC(jcontext ctx) {
+ 
+     auto collectTime = std::chrono::system_clock::now();
+ 
++    // ponytail: allocation census for tuning, only when a "gc-stats" file sits in the working dir at startup
++    static int gcStats = -1;
++    static std::unordered_map<jclass, int> gcStatCounts;
++    if (gcStats < 0) {
++        FILE *probe = fopen("gc-stats", "r");
++        gcStats = probe != nullptr;
++        if (probe) fclose(probe);
++    }
++    gcStatCounts.clear();
++
+     // Collect unreachable objects
+     for (jobject obj : *objects) {
+-        if ((obj->gcMark > GC_MARK_COLLECTED && obj->gcMark < GC_MARK_START) || obj->gcMark == mark)
++        // >=: an object already queued stays in `objects` until the collection thread frees it; queueing it again
++        // finalizes freed memory (vtable zeroed) if another GC runs first
++        if ((obj->gcMark >= GC_MARK_COLLECTED && obj->gcMark < GC_MARK_START) || obj->gcMark == mark)
+             continue;
+         obj->gcMark = GC_MARK_COLLECTED;
+         collectedObjects.emplace_back(obj);
++        if (gcStats) gcStatCounts[(jclass) obj->clazz]++;
+ 
+         // Update weak references
+         for (auto[it, end] = weakReferences.equal_range(obj); it != end; ++it)
+@@ -734,13 +923,41 @@ void runGC(jcontext ctx) {
+ #endif
+ 
+     allocationsSinceCollection = 0;
++    auto liveCount = (int)objects->size(), queuedCount = (int)collectedObjects.size();
+ 
++    objectsLock.unlock();
+     releaseCriticalLock();
+     {
+         std::lock_guard lock(suspendMutex);
+         suspendVM = false;
+     }
+ 
++    // ponytail: one line per pause >= 20 ms in ./gc.log (stdout is lost on the console), for tuning the thresholds
++    {
++        auto now = std::chrono::system_clock::now();
++        auto ms = [](auto a, auto b) { return (int)std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count(); };
++        if (ms(blockTime, now) >= 20) {
++            if (FILE *f = fopen("gc.log", "a")) {
++                fprintf(f, "%lld pause %d ms (suspend %d, mark %d, collect %d) live %d queued %d heap %lld MB\n",
++                        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count(),
++                        ms(blockTime, now), ms(blockTime, copyTime), ms(copyTime, collectTime), ms(collectTime, now),
++                        liveCount, queuedCount, (long long)(heapUsage >> 20));
++                fclose(f);
++            }
++        }
++        if (gcStats && !gcStatCounts.empty()) {
++            std::vector<std::pair<int, jclass>> top;
++            for (auto &pair : gcStatCounts)
++                top.emplace_back(pair.second, pair.first);
++            std::sort(top.begin(), top.end(), [](auto &a, auto &b) { return a.first > b.first; });
++            if (FILE *f = fopen("gc.log", "a")) {
++                for (int i = 0; i < (int) top.size() && i < 12; i++)
++                    fprintf(f, "  %8d %s\n", top[i].first, (const char *) top[i].second->nativeName);
++                fclose(f);
++            }
++        }
++    }
++
+ #if false // Todo: Use macro
+     auto finishTime = std::chrono::system_clock::now();
+ 
+@@ -767,6 +984,10 @@ void markDeepObject(jobject obj) {
+     deepMarkedObjects.emplace_back(obj);
+ }
+ 
++int64_t getAllocationsSinceCollection() {
++    return allocationsSinceCollection;
++}
++
+ int64_t getHeapUsage() {
+     return heapUsage;
+ }
+@@ -894,7 +1115,7 @@ NORETURN void throwRuntimeException(jcontext ctx, const char *message) {
+ /// Lock on a monitor. Throws exceptions.
+ void monitorEnter(jcontext ctx, jobject object) {
+     NULL_CHECK(object);
+-    auto monitor = (jmonitor) object->monitor;
++    auto monitor = getObjectMonitor(object);
+ 
+     // Race condition here is fine, fall back to slower/blocking acquire
+     if (monitor->lock.try_lock()) {
+@@ -920,7 +1141,7 @@ void monitorEnter(jcontext ctx, jobject object) {
+ /// Unlock on a monitor. Throws exceptions.
+ void monitorExit(jcontext ctx, jobject object) {
+     NULL_CHECK(object);
+-    auto monitor = (jmonitor) object->monitor;
++    auto monitor = getObjectMonitor(object);
+     monitorOwnerCheck(ctx, object);
+     if (--monitor->depth == 0)
+         monitor->owner = nullptr;
+@@ -929,8 +1150,8 @@ void monitorExit(jcontext ctx, jobject object) {
+ 
+ /// Checks if the current thread owns a given monitor. Throws exceptions.
+ void monitorOwnerCheck(jcontext ctx, jobject object) {
+-    auto monitor = (jmonitor) object->monitor;
+-    if (!monitor->owner or monitor->owner != ctx)
++    auto monitor = (jmonitor) __atomic_load_n(&object->monitor, __ATOMIC_ACQUIRE); // none yet: nobody owns it
++    if (!monitor or !monitor->owner or monitor->owner != ctx)
+         constructAndThrow<&class_java_lang_IllegalMonitorStateException, init_java_lang_IllegalMonitorStateException>(ctx);
+ }
+ 
+diff --git i/runtime/res/clearwing/src/Clearwing.h w/runtime/res/clearwing/src/Clearwing.h
+index d89ddfd..d4a66d3 100644
+--- i/runtime/res/clearwing/src/Clearwing.h
++++ w/runtime/res/clearwing/src/Clearwing.h
+@@ -262,6 +262,13 @@ jstring stringFromNativeLength(jcontext ctx, const char *string, int length);
+ jstring stringFromNativeProtected(jcontext ctx, const char *string);
+ jstring stringFromNativeEternal(jcontext ctx, const char *string);
+ jstring createStringLiteral(jcontext ctx, StringLiteral string);
++// Literal at a call site: resolved once (the pool takes a mutex, a setjmp and a map search per use, every frame
++// for a literal inside a render loop)
++#define STRING_LITERAL(ctx, literal) ({ \
++    static std::atomic<jstring> cachedLiteral_; \
++    jstring literal_ = cachedLiteral_.load(std::memory_order_acquire); \
++    if (!literal_) { literal_ = createStringLiteral(ctx, literal); cachedLiteral_.store(literal_, std::memory_order_release); } \
++    literal_; })
+ const char *stringToNative(jcontext ctx, jstring string);
+ jstring concatStringsRecipe(jcontext ctx, const char *recipe, int argCount, ...);
+ 
+diff --git i/runtime/res/clearwing/src/FileInputStream.cpp w/runtime/res/clearwing/src/FileInputStream.cpp
+index 549b717..16ff521 100644
+--- i/runtime/res/clearwing/src/FileInputStream.cpp
++++ w/runtime/res/clearwing/src/FileInputStream.cpp
+@@ -1,14 +1,22 @@
+ #include "java/io/FileInputStream.h"
+ #include "java/io/FileNotFoundException.h"
+ 
++
++// FILEs opened by java.io streams (System.cpp): the game leaks some, and exit()'s stdio flush lseeks them after the
++// RomFS is gone. Declared here, not in Clearwing.h, so the change doesn't rebuild every class
++extern "C" void registerOpenFile(FILE *file);
++extern "C" void unregisterOpenFile(FILE *file);
++
+ extern "C" {
+ 
+ void M_java_io_FileInputStream_open_java_lang_String(jcontext ctx, jobject self, jobject nameObj) {
+     auto stream = (java_io_FileInputStream *) NULL_CHECK(self);
+     auto name = stringToNative(ctx, (jstring) NULL_CHECK(nameObj));
+     auto f = fopen(name, "rb");
+-    if (f)
++    if (f) {
+         stream->F_file = (jlong) f;
++        registerOpenFile(f);
++    }
+     else
+         constructAndThrow<&class_java_io_FileNotFoundException, init_java_io_FileNotFoundException>(ctx);
+ }
+@@ -66,6 +74,7 @@ void M_java_io_FileInputStream_close0(jcontext ctx, jobject self) {
+     auto f = (FILE *) stream->F_file;
+     if (!f)
+         return;
++    unregisterOpenFile(f);
+     if (fclose(f))
+         throwIOException(ctx, nullptr);
+     stream->F_file = 0;
+diff --git i/runtime/res/clearwing/src/FileOutputStream.cpp w/runtime/res/clearwing/src/FileOutputStream.cpp
+index 2a16960..e150ed5 100644
+--- i/runtime/res/clearwing/src/FileOutputStream.cpp
++++ w/runtime/res/clearwing/src/FileOutputStream.cpp
+@@ -1,14 +1,22 @@
+ #include "java/io/FileOutputStream.h"
+ #include "java/io/FileNotFoundException.h"
+ 
++
++// FILEs opened by java.io streams (System.cpp): the game leaks some, and exit()'s stdio flush lseeks them after the
++// RomFS is gone. Declared here, not in Clearwing.h, so the change doesn't rebuild every class
++extern "C" void registerOpenFile(FILE *file);
++extern "C" void unregisterOpenFile(FILE *file);
++
+ extern "C" {
+ 
+ void M_java_io_FileOutputStream_open_java_lang_String_boolean(jcontext ctx, jobject self, jobject nameObj, jbool append) {
+     auto stream = (java_io_FileOutputStream *) NULL_CHECK(self);
+     auto name = stringToNative(ctx, (jstring) NULL_CHECK(nameObj));
+     auto f = fopen(name, append ? "ab" : "wb");
+-    if (f)
++    if (f) {
+         stream->F_file = (jlong) f;
++        registerOpenFile(f);
++    }
+     else
+         constructAndThrow<&class_java_io_FileNotFoundException, init_java_io_FileNotFoundException>(ctx);
+ }
+@@ -44,6 +52,7 @@ void M_java_io_FileOutputStream_close0(jcontext ctx, jobject self) {
+     auto f = (FILE *) stream->F_file;
+     if (!f)
+         return;
++    unregisterOpenFile(f);
+     if (fclose(f))
+         throwIOException(ctx, nullptr);
+     stream->F_file = 0;
+diff --git i/runtime/res/clearwing/src/Object.cpp w/runtime/res/clearwing/src/Object.cpp
+index e0c3314..71d756c 100644
+--- i/runtime/res/clearwing/src/Object.cpp
++++ w/runtime/res/clearwing/src/Object.cpp
+@@ -7,6 +7,9 @@
+ #include <cstring>
+ #include <string>
+ 
++
++extern "C" jmonitor getObjectMonitor(jobject object); // Clearwing.cpp: created on first use
++
+ extern "C" {
+ 
+ void clinit_java_lang_Object(jcontext ctx) {
+@@ -50,12 +53,12 @@ void M_java_lang_Object_finalize(jcontext ctx, jobject self) {
+ 
+ void M_java_lang_Object_notify(jcontext ctx, jobject self) {
+     monitorOwnerCheck(ctx, self);
+-    ((jmonitor) self->monitor)->condition.notify_one();
++    getObjectMonitor(self)->condition.notify_one();
+ }
+ 
+ void M_java_lang_Object_notifyAll(jcontext ctx, jobject self) {
+     monitorOwnerCheck(ctx, self);
+-    ((jmonitor) self->monitor)->condition.notify_all();
++    getObjectMonitor(self)->condition.notify_all();
+ }
+ 
+ void M_java_lang_Object_wait(jcontext ctx, jobject self) {
+@@ -67,7 +70,7 @@ void M_java_lang_Object_wait(jcontext ctx, jobject self) {
+     monitorExit(ctx, self);
+ 
+     ctx->suspended = true;
+-    auto monitor = (jmonitor) self->monitor;
++    auto monitor = getObjectMonitor(self);
+     {
+         std::unique_lock<std::mutex> lock(monitor->conditionMutex);
+         monitor->condition.wait(lock);
+@@ -95,7 +98,7 @@ void M_java_lang_Object_wait_long_int(jcontext ctx, jobject self, jlong millis,
+     monitorExit(ctx, self);
+ 
+     ctx->suspended = true;
+-    auto monitor = (jmonitor) self->monitor;
++    auto monitor = getObjectMonitor(self);
+     {
+         std::unique_lock<std::mutex> lock(monitor->conditionMutex);
+         monitor->condition.wait_for(lock, std::chrono::milliseconds(millis) + std::chrono::nanoseconds(nanos));
+diff --git i/runtime/res/clearwing/src/String.cpp w/runtime/res/clearwing/src/String.cpp
+index 730d6a1..6fef074 100644
+--- i/runtime/res/clearwing/src/String.cpp
++++ w/runtime/res/clearwing/src/String.cpp
+@@ -9,23 +9,62 @@
+ extern "C" {
+ 
+ jobject SM_java_lang_String_bytesToChars_Array1_byte_int_int_java_lang_String_R_Array1_char(jcontext ctx, jobject bytesObj, jint offset, jint length, jobject encodingObj) {
+-    // Todo: Respect encoding
++    // JDK behaviour: malformed UTF-8 becomes U+FFFD instead of an exception; single-byte charsets map directly
+     auto bytes = (jarray) NULL_CHECK(bytesObj);
+     length = std::min(bytes->length, length);
+     if (length + offset > bytes->length or offset < 0 or length < 0)
+         throwIndexOutOfBounds(ctx);
+     if (length == 0)
+         return (jobject) createArray(ctx, &class_char, 0);
+-    auto data = (char *)bytes->data + offset;
+-    try {
+-        auto string = std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t>{}.from_bytes(data, data + length);
+-        auto array = createArray(ctx, &class_char, (int) string.length());
+-        memcpy(array->data, string.c_str(), string.length() * 2);
+-        return (jobject) array;
+-    } catch (std::exception &ex) {
+-        throwIOException(ctx, "Failed to decode bytes");
+-        return nullptr;
++    auto data = (const unsigned char *)bytes->data + offset;
++    bool singleByte = false;
++    int utf16 = 0; // 1 = big endian, 2 = little endian
++    if (encodingObj) {
++        std::string enc = stringToNative(ctx, (jstring) encodingObj);
++        for (auto &c : enc) c = (char) tolower(c);
++        singleByte = enc == "iso-8859-1" or enc == "iso8859_1" or enc == "latin1" or enc == "us-ascii" or enc == "ascii"
++                     or enc == "windows-1252" or enc == "cp1252";
++        if (enc == "utf-16be" or enc == "unicodebigunmarked") utf16 = 1;
++        else if (enc == "utf-16le" or enc == "unicodelittleunmarked") utf16 = 2;
++        else if (enc == "utf-16" or enc == "utf16" or enc == "unicode") {
++            utf16 = 1; // JDK: BOM decides, big endian without one
++            if (length >= 2 and data[0] == 0xFF and data[1] == 0xFE) { utf16 = 2; data += 2; length -= 2; }
++            else if (length >= 2 and data[0] == 0xFE and data[1] == 0xFF) { data += 2; length -= 2; }
++        }
+     }
++    if (utf16) {
++        int n = length / 2;
++        auto array = createArray(ctx, &class_char, n);
++        auto chars = (char16_t *) array->data;
++        for (int i = 0; i < n; i++)
++            chars[i] = utf16 == 1 ? (char16_t) (data[2 * i] << 8 | data[2 * i + 1]) : (char16_t) (data[2 * i + 1] << 8 | data[2 * i]);
++        return (jobject) array;
++    }
++    std::u16string out;
++    out.reserve(length);
++    for (int i = 0; i < length;) {
++        unsigned char b = data[i];
++        if (singleByte or b < 0x80) { out.push_back(b); i++; continue; }
++        int need = b >= 0xF5 ? -1 : b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : b >= 0xC2 ? 1 : -1;
++        if (need < 0) { out.push_back(0xFFFD); i++; continue; } // invalid lead byte
++        unsigned int cp = b & (0x3F >> need);
++        bool ok = true;
++        for (int k = 1; k <= need; k++) {
++            if (i + k >= length or (data[i + k] & 0xC0) != 0x80) { ok = false; break; }
++            cp = (cp << 6) | (data[i + k] & 0x3F);
++        }
++        if (!ok) { out.push_back(0xFFFD); i++; continue; }
++        i += need + 1;
++        if (cp >= 0x10000) {
++            cp -= 0x10000;
++            out.push_back((char16_t) (0xD800 + (cp >> 10)));
++            out.push_back((char16_t) (0xDC00 + (cp & 0x3FF)));
++        } else
++            out.push_back((char16_t) cp);
++    }
++    auto array = createArray(ctx, &class_char, (int) out.length());
++    memcpy(array->data, out.data(), out.length() * 2);
++    return (jobject) array;
+ }
+ 
+ jobject M_java_lang_String_getBytes_java_lang_String_R_Array1_byte(jcontext ctx, jobject self, jobject encodingObj) {
+diff --git i/runtime/res/clearwing/src/System.cpp w/runtime/res/clearwing/src/System.cpp
+index 3ff967c..c97e69a 100644
+--- i/runtime/res/clearwing/src/System.cpp
++++ w/runtime/res/clearwing/src/System.cpp
+@@ -3,6 +3,10 @@
+ #include "java/lang/IllegalArgumentException.h"
+ 
+ #include <cstring>
++#include <mutex>
++#include <set>
++
++extern "C" int64_t getAllocationsSinceCollection(); // Clearwing.cpp (inside its extern "C" section)
+ #include <chrono>
+ 
+ extern "C" {
+@@ -29,12 +33,36 @@ jlong SM_java_lang_System_currentTimeMillis_R_long(jcontext ctx) {
+     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+ }
+ 
++static std::mutex openFilesLock;
++static std::set<FILE *> openFiles;
++
++void registerOpenFile(FILE *file) {
++    std::lock_guard guard(openFilesLock);
++    openFiles.insert(file);
++}
++
++void unregisterOpenFile(FILE *file) {
++    std::lock_guard guard(openFilesLock);
++    openFiles.erase(file);
++}
++
++void closeOpenFiles() {
++    std::lock_guard guard(openFilesLock);
++    for (FILE *file : openFiles)
++        fclose(file);
++    openFiles.clear();
++}
++
+ void SM_java_lang_System_exit0_int(jcontext ctx, jint code) {
++    closeOpenFiles(); // leaked streams crashed exit() on the Switch (stdio flush -> lseek on an unmounted RomFS)
+     shutdownVM(ctx);
+     exit(code);
+ }
+ 
+ void SM_java_lang_System_gc(jcontext ctx) {
++    // a hint (JLS): the game calls it on every dialog and transition, a 50-90 ms pause each on the console
++    if (getAllocationsSinceCollection() < 200000)
++        return;
+     runGC(ctx);
+ }
+ 
+@@ -46,8 +74,8 @@ jobject SM_java_lang_System_getProperty_java_lang_String_R_java_lang_String(jcon
+         return (jobject) createStringLiteral(ctx, u8"Clearwing"_j);
+     std::lock_guard guard(lock);
+     auto it = cache.find(key);
+-    if (it != cache.end())
+-        return (jobject) stringFromNative(ctx, it->second);
++    if (it != cache.end()) // unknown keys are cached as nullptr: answer null again, don't convert it
++        return it->second ? (jobject) stringFromNative(ctx, it->second) : nullptr;
+     auto &entry = cache[key];
+     entry = getSystemProperty(key);
+     return entry ? (jobject) stringFromNative(ctx, entry) : nullptr;
+diff --git i/runtime/res/clearwing/src/Thread.cpp w/runtime/res/clearwing/src/Thread.cpp
+index e1a9fad..38f7285 100644
+--- i/runtime/res/clearwing/src/Thread.cpp
++++ w/runtime/res/clearwing/src/Thread.cpp
+@@ -9,9 +9,26 @@
+ 
+ #include <thread>
+ 
++
++extern "C" jmonitor getObjectMonitor(jobject object); // Clearwing.cpp: created on first use
++
+ extern "C" {
+ 
++
++#ifdef __SWITCH__
++extern "C" uint32_t svcSetThreadCoreMask(uint32_t handle, int32_t preferredCore, uint32_t affinityMask);
++#endif
++// The Switch starts every thread on the main thread's core: move helpers to the two other cores the app may use
++static inline void pinCurrentThreadToCore(int core) {
++#ifdef __SWITCH__
++    svcSetThreadCoreMask(0xFFFF8000 /* CUR_THREAD_HANDLE */, core, 1u << core); // failure (applet mode): stays put
++#else
++    (void) core;
++#endif
++}
++
+ void threadEntrypoint(jcontext ctx, jthread thread) {
++    pinCurrentThreadToCore(2); // Java threads (the AssetManager loader) off the game's core
+     attachThread(ctx);
+ 
+     try {
+@@ -84,7 +101,7 @@ void M_java_lang_Thread_interrupt(jcontext ctx, jobject self) {
+     threadCtx->lock.lock();
+     threadCtx->thread->F_interrupted = true;
+     if (threadCtx->blockedBy)
+-        ((jmonitor) ((jobject) threadCtx->blockedBy)->monitor)->condition.notify_all();
++        getObjectMonitor((jobject) threadCtx->blockedBy)->condition.notify_all();
+     threadCtx->lock.unlock();
+ }
+ 
+diff --git i/runtime/src/java/io/File.java w/runtime/src/java/io/File.java
+index a22dfef..f0f7e2a 100644
+--- i/runtime/src/java/io/File.java
++++ w/runtime/src/java/io/File.java
+@@ -229,14 +229,13 @@ public class File {
+ 
+ 	public native boolean mkdir ();
+ 
+-	public boolean mkdirs () {
+-		File dir = this;
+-		while (dir != null && !dir.path.isEmpty()) {
+-			if (!dir.exists() && !dir.mkdir())
+-				return false;
+-			dir = dir.getParentFile();
+-		}
+-		return true;
++	public boolean mkdirs () { // parents first (the original tried the leaf first and gave up)
++		if (exists())
++			return false;
++		File parent = getParentFile();
++		if (parent != null && !parent.path.isEmpty() && !parent.exists())
++			parent.mkdirs();
++		return mkdir();
+ 	}
+ 
+ 	public boolean renameTo (File f) {
+@@ -285,6 +284,6 @@ public class File {
+ 
+ 	@Override
+ 	public String toString () {
+-		return "File(" + path + ")";
++		return getPath(); // JDK contract: games build paths from it
+ 	}
+ }
+diff --git i/runtime/src/java/lang/Byte.java w/runtime/src/java/lang/Byte.java
+index f71319a..0a022b7 100644
+--- i/runtime/src/java/lang/Byte.java
++++ w/runtime/src/java/lang/Byte.java
+@@ -116,8 +116,14 @@ public final class Byte extends Number implements Comparable<Byte> {
+      * @param i the primitive
+      * @return object instance
+      */
++    private static final Byte[] CACHE = new Byte[256];
++
++    // JLS 5.1.7: boxing -128..127 yields cached instances (the runtime allocated one per call: ~460k Integers per GC)
+     public static Byte valueOf(byte i) {
+-        return new Byte(i);
++        Byte cached = CACHE[i + 128];
++        if (cached == null)
++            CACHE[i + 128] = cached = new Byte(i);
++        return cached;
+     }
+ 
+     public static Byte valueOf(String s) {
+diff --git i/runtime/src/java/lang/Character.java w/runtime/src/java/lang/Character.java
+index aadcdb8..46e1356 100644
+--- i/runtime/src/java/lang/Character.java
++++ w/runtime/src/java/lang/Character.java
+@@ -1451,8 +1451,16 @@ public final class Character implements Comparable<Character>{
+      * @param i the primitive
+      * @return object instance
+      */
++    private static final Character[] CACHE = new Character[128];
++
++    // JLS 5.1.7: boxing -128..127 yields cached instances (the runtime allocated one per call: ~460k Integers per GC)
+     public static Character valueOf(char i) {
+-        return new Character(i);
++        if (i > 127)
++            return new Character(i);
++        Character cached = CACHE[i];
++        if (cached == null)
++            CACHE[i] = cached = new Character(i);
++        return cached;
+     }
+ 
+     /**
+diff --git i/runtime/src/java/lang/Class.java w/runtime/src/java/lang/Class.java
+index 1b1a726..d0b5f3d 100644
+--- i/runtime/src/java/lang/Class.java
++++ w/runtime/src/java/lang/Class.java
+@@ -383,6 +383,10 @@ public final class Class<T> implements java.lang.reflect.Type {
+             valuesField.setAccessible(true);
+             return (Object[]) valuesField.get(null);
+         } catch (NoSuchFieldException | IllegalAccessException ignored) {}
++        // obfuscated enums (ProGuard renames $VALUES) still keep the static values() the JVM itself relies on
++        try {
++            return (Object[]) getMethod("values").invoke(null);
++        } catch (Exception ignored) {}
+         return new Object[0];
+     }
+ 
+diff --git i/runtime/src/java/lang/Integer.java w/runtime/src/java/lang/Integer.java
+index d84855f..a3ce3f1 100644
+--- i/runtime/src/java/lang/Integer.java
++++ w/runtime/src/java/lang/Integer.java
+@@ -481,8 +481,16 @@ public final class Integer extends Number implements Comparable<Integer> {
+ 	 * @param i the primitive
+ 	 * @return object instance
+ 	 */
++	private static final Integer[] CACHE = new Integer[256];
++
++	// JLS 5.1.7: boxing -128..127 yields cached instances (the runtime allocated one per call: ~460k Integers per GC)
+ 	public static Integer valueOf (int i) {
+-		return new Integer(i);
++		if (i < -128 || i > 127)
++			return new Integer(i);
++		Integer cached = CACHE[i + 128];
++		if (cached == null)
++			CACHE[i + 128] = cached = new Integer(i); // a racing thread at worst makes a twin
++		return cached;
+ 	}
+ 
+ 	/**
+diff --git i/runtime/src/java/lang/Long.java w/runtime/src/java/lang/Long.java
+index e946992..c7e70aa 100644
+--- i/runtime/src/java/lang/Long.java
++++ w/runtime/src/java/lang/Long.java
+@@ -387,8 +387,16 @@ public final class Long extends Number implements Comparable<Long> {
+ 	 * @param i the primitive
+ 	 * @return object instance
+ 	 */
++	private static final Long[] CACHE = new Long[256];
++
++	// JLS 5.1.7: boxing -128..127 yields cached instances (the runtime allocated one per call: ~460k Integers per GC)
+ 	public static Long valueOf (long i) {
+-		return new Long(i);
++		if (i < -128 || i > 127)
++			return new Long(i);
++		Long cached = CACHE[(int) i + 128];
++		if (cached == null)
++			CACHE[(int) i + 128] = cached = new Long(i);
++		return cached;
+ 	}
+ 
+ 	public static Long valueOf(String s) {
+diff --git i/runtime/src/java/lang/Short.java w/runtime/src/java/lang/Short.java
+index 847e57a..fd9786d 100644
+--- i/runtime/src/java/lang/Short.java
++++ w/runtime/src/java/lang/Short.java
+@@ -109,8 +109,16 @@ public final class Short extends Number implements Comparable<Short> {
+      * @param i the primitive
+      * @return object instance
+      */
++    private static final Short[] CACHE = new Short[256];
++
++    // JLS 5.1.7: boxing -128..127 yields cached instances (the runtime allocated one per call: ~460k Integers per GC)
+     public static Short valueOf(short i) {
+-        return new Short(i);
++        if (i < -128 || i > 127)
++            return new Short(i);
++        Short cached = CACHE[i + 128];
++        if (cached == null)
++            CACHE[i + 128] = cached = new Short(i);
++        return cached;
+     }
+ 
+     public static Short valueOf(String s) {
+diff --git i/runtime/src/java/lang/StringToReal.java w/runtime/src/java/lang/StringToReal.java
+index df5d550..8481565 100644
+--- i/runtime/src/java/lang/StringToReal.java
++++ w/runtime/src/java/lang/StringToReal.java
+@@ -164,6 +164,12 @@ final class StringToReal {
+         if ((length = s.length()) == 0) {
+             throw invalidReal(s, isDouble);
+         }
++        for (int i = 0; i < length; i++) { // the mantissa must be digits only ("1.3.1210" is not a number)
++            char ch = s.charAt(i);
++            if (ch < '0' || ch > '9') {
++                throw invalidReal(s, isDouble);
++            }
++        }
+ 
+         end = length;
+         while (end > 1 && s.charAt(end - 1) == '0') {

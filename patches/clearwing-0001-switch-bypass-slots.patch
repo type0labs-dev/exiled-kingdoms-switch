@@ -1,0 +1,100 @@
+diff --git i/transpiler/src/com/thelogicmaster/clearwing/BytecodeClass.java w/transpiler/src/com/thelogicmaster/clearwing/BytecodeClass.java
+index 75a1f76..5618c8d 100644
+--- i/transpiler/src/com/thelogicmaster/clearwing/BytecodeClass.java
++++ w/transpiler/src/com/thelogicmaster/clearwing/BytecodeClass.java
+@@ -24,6 +24,17 @@ public class BytecodeClass {
+ 			new BytecodeMethod(OBJECT_CLASS, "wait", Opcodes.ACC_PUBLIC, "(JI)V", null, null),
+ 	};
+ 
++	/** Highest bypass slot written by any jump, looking inside optimized instruction groups. */
++	private static int maxBypassSlot(java.util.List<com.thelogicmaster.clearwing.bytecode.Instruction> instructions) {
++		int m = -1;
++		for (com.thelogicmaster.clearwing.bytecode.Instruction ins : instructions) {
++			if (ins instanceof InstructionGroup g) m = Math.max(m, maxBypassSlot(g.getInstructions()));
++			else if (ins instanceof com.thelogicmaster.clearwing.bytecode.SwitchInstruction sw) m = Math.max(m, sw.getMaxBypass());
++			else if (ins instanceof com.thelogicmaster.clearwing.bytecode.JumpInstruction j) m = Math.max(m, j.getBypass());
++		}
++		return m;
++	}
++
+ 	private final String originalName;
+ 	private final String originalSuperName;
+ 	private final String superName;
+@@ -437,12 +448,19 @@ public class BytecodeClass {
+ 				builder.append("\tNULL_CHECK(self);\n");
+ 
+ 			int stackSize = method.getStackSize() + method.getLocalCount();
++			// a jump can keep its bypass slot after its try-catch was dropped: size the array from the jumps too
++			int bypassSlots = Math.max(method.getTryCatchBypasses(), maxBypassSlot(method.getInstructions()) + 1);
++			// volatile is for setjmp: only a method with a handler reads its frame after a longjmp. Without one the
++			// frame can live in registers between calls; its address escapes into pushStackFrame, so it is stored
++			// before every opaque call (where the GC can scan it)
++			String frameQualifier = method.getTryCatchBlocks().isEmpty() && bypassSlots == 0 ? "" : "volatile ";
+ 			if (stackSize > 0) {
+-				builder.append("\tvolatile jtype frame[").append(stackSize).append("];\n");
++				builder.append("\t").append(frameQualifier).append("jtype frame[").append(stackSize).append("];\n");
+ 				builder.append("\tauto stack = &frame[").append(method.getLocalCount()).append("];\n");
+-				builder.append("\tvolatile jtype *sp = stack;\n");
++				builder.append("\t").append(frameQualifier).append("jtype *sp = stack;\n");
+ 			}
+-			builder.append("\tFrameInfo frameInfo { ").append("\"").append(name).append(":")
++			builder.append("\tstatic const FrameInfo frameInfo { ") // static: constant, and the sampler (Clearwing.cpp) reads it from another thread
++				.append("\"").append(name).append(":")
+ 					.append(method.getOriginalName()).append("\", ").append(stackSize).append(" };\n");
+ 			builder.append("\tauto frameRef = pushStackFrame(ctx, &frameInfo, ")
+ 					.append(stackSize > 0 ? "frame" : "nullptr").append(", ");
+@@ -454,8 +472,8 @@ public class BytecodeClass {
+ 				builder.append("self");
+ 			builder.append(");\n");
+ 			
+-			if (method.getTryCatchBypasses() > 0)
+-				builder.append("\tvolatile bool bypasses[").append(method.getTryCatchBypasses()).append("]{};\n");
++			if (bypassSlots > 0)
++				builder.append("\tvolatile bool bypasses[").append(bypassSlots).append("]{};\n");
+ 			
+ 			builder.append("\n");
+ 
+diff --git i/transpiler/src/com/thelogicmaster/clearwing/Utils.java w/transpiler/src/com/thelogicmaster/clearwing/Utils.java
+index 11b681a..1fbc536 100644
+--- i/transpiler/src/com/thelogicmaster/clearwing/Utils.java
++++ w/transpiler/src/com/thelogicmaster/clearwing/Utils.java
+@@ -159,7 +159,7 @@ public class Utils {
+ 			else
+ 				return "jdouble(" + formatDoubleLiteral(d) + ")";
+ 		} else if (o instanceof String)
+-			return "((jobject) createStringLiteral(ctx, " + Utils.encodeStringLiteral((String)o) + "))";
++			return "((jobject) STRING_LITERAL(ctx, " + Utils.encodeStringLiteral((String)o) + "))";
+ 		else if (o instanceof Type)
+ 			switch (((Type) o).getSort()) {
+ 				case Type.OBJECT, Type.ARRAY -> {
+diff --git i/transpiler/src/com/thelogicmaster/clearwing/bytecode/LoadConstantInstruction.java w/transpiler/src/com/thelogicmaster/clearwing/bytecode/LoadConstantInstruction.java
+index 1f892b1..69ac657 100644
+--- i/transpiler/src/com/thelogicmaster/clearwing/bytecode/LoadConstantInstruction.java
++++ w/transpiler/src/com/thelogicmaster/clearwing/bytecode/LoadConstantInstruction.java
+@@ -35,7 +35,7 @@ public class LoadConstantInstruction extends Instruction {
+         if (value instanceof Integer || value instanceof Long || value instanceof Float || value instanceof Double || value instanceof Type)
+             return Utils.getObjectValue(value);
+         else if (value instanceof String)
+-            return "((jobject) createStringLiteral(ctx, " + Utils.encodeStringLiteral((String)value) + "))";
++            return "((jobject) STRING_LITERAL(ctx, " + Utils.encodeStringLiteral((String)value) + "))";
+         else if (value instanceof Handle) {
+             throw new TranspilerException("Unsupported value: " + value); // Todo
+         }
+diff --git i/transpiler/src/com/thelogicmaster/clearwing/bytecode/SwitchInstruction.java w/transpiler/src/com/thelogicmaster/clearwing/bytecode/SwitchInstruction.java
+index baeee44..790b5ad 100644
+--- i/transpiler/src/com/thelogicmaster/clearwing/bytecode/SwitchInstruction.java
++++ w/transpiler/src/com/thelogicmaster/clearwing/bytecode/SwitchInstruction.java
+@@ -92,6 +92,13 @@ public class SwitchInstruction extends Instruction implements JumpingInstruction
+ 		return originalDefaultLabel;
+ 	}
+ 
++	/** Highest try-catch bypass slot this switch writes (-1 if none). */
++	public int getMaxBypass() {
++		int m = defaultLabelBypass;
++		for (int b : labelBypasses) m = Math.max(m, b);
++		return m;
++	}
++
+ 	@Override
+ 	public void setJumpBypass(int bypass, int label, int bypassLabel) {
+ 		if (label == defaultLabel) {

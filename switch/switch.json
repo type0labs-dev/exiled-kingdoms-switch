@@ -1,0 +1,11 @@
+{
+    "mainClass": "eksw.SwitchLauncher",
+    "reflective": [
+        "net.fdgames.**"
+    ],
+    "nonOptimized": [],
+    "useStackTraces": true,
+    "useLineNumbers": true,
+    "useValueChecks": true,
+    "useStackCookies": true
+}

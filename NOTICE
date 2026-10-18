@@ -1,0 +1,14 @@
+Exiled Kingdoms for Nintendo Switch (homebrew) — notices
+
+This repository contains no code or assets from Exiled Kingdoms. Exiled Kingdoms is (c) FDG Entertainment; the
+build reads the user's own copy of the PC game. Builds produced from it contain the game's assets and are for the
+owner's personal use only; do not distribute them.
+
+- Code in this repository: MIT (see LICENSE), except as noted below.
+- patches/clearwing-*.patch modify Clearwing (https://github.com/SwitchGDX/clearwing-vm) and are distributed under
+  Clearwing's license, the GNU General Public License version 2.
+- gdxpatch/src/** and the method bodies GdxPatch rewrites are derived from libGDX (https://libgdx.com), Apache
+  License 2.0.
+- Fetched at build time, not included: libGDX, gdx-controllers, SwitchGDX (TheLogicMaster), regexodus, LWJGL,
+  JInput, ASM, libffi, devkitPro toolchain and libraries — each under its own license.
+- tools/deob/mapping-manual.tsv lists names from the public libGDX API for members of the game's bundled copy.
