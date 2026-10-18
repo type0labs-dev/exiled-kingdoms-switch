@@ -9,6 +9,15 @@ no cursor, every screen driven by focus navigation and button prompts.
 > yourself from **your own copy** of the PC game (`exiledkingdoms.jar` from Steam). Please buy the game; the
 > developers deserve it. This project is not affiliated with or endorsed by FDG Entertainment.
 
+<p align="center">
+  <img src="docs/media/06-combat.jpg" width="49%" alt="Combat on a forest road">
+  <img src="docs/media/05-loot-take-all.jpg" width="49%" alt="Loot window with focus frame and button prompts">
+  <img src="docs/media/08-skill-guide-zl.jpg" width="49%" alt="Holding ZL lists the skill on each face button">
+  <img src="docs/media/09-controls-legend.jpg" width="49%" alt="Holding minus shows every control">
+  <img src="docs/media/01-main-menu.jpg" width="49%" alt="Main menu with the focus frame">
+  <img src="docs/media/11-night-lighting.jpg" width="49%" alt="Night lighting">
+</p>
+
 ## How it works
 
 The PC game is Java on libGDX. The Switch has no JVM, so the build runs a pipeline of AOT translation:
